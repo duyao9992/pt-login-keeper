@@ -12,7 +12,7 @@ PT 站 Cookie 登录保活与失效提醒工具。
 - 手动立即检测
 - 成功/失效关键词自定义
 - 30 天保号倒计时提醒
-- Webhook、Server 酱、PushPlus 通知
+- Webhook、企业微信机器人/微信转发、Server 酱、PushPlus 通知
 - Docker 部署
 - GitHub Actions 自动发布 GHCR 镜像
 
@@ -101,6 +101,26 @@ password
 ```
 
 10. 保存后点击“检测”或“立即检测全部”。
+
+## 微信通知
+
+如果已经有企业微信机器人或微信转发服务器，在首页“通知设置”里填写：
+
+```text
+企业微信机器人 / 微信转发 Webhook
+```
+
+工具会按企业微信机器人格式发送：
+
+```json
+{"msgtype":"text","text":{"content":"通知内容"}}
+```
+
+如果你的转发服务器只接收普通 JSON，则使用“通用 Webhook URL”，工具会发送：
+
+```json
+{"title":"标题","text":"正文"}
+```
 
 ## 安全边界
 
