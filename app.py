@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import threading
 import time
 import uuid
@@ -68,6 +69,7 @@ def load_config() -> dict[str, Any]:
                 "warn_days": 7,
                 "notify_cooldown_hours": 12,
                 "webhook_url": "",
+                "wecom_robot_webhook": "",
                 "serverchan_sendkey": "",
                 "pushplus_token": "",
             },
@@ -123,6 +125,13 @@ def normalize_site(form: dict[str, list[str]], existing: dict[str, Any] | None =
     site_id = form_value(form, "id") or existing.get("id") or uuid.uuid4().hex[:12]
     interval_hours = max(as_int(form_value(form, "interval_hours"), 168), 1)
     expire_days = max(as_int(form_value(form, "expire_days"), 30), 1)
+    request_headers = form_value(form, "request_headers").strip()
+    extracted = parse_request_headers(request_headers)
+    cookie = form_value(form, "cookie").strip() or extracted.get("cookie", "")
+    authorization = form_value(form, "authorization").strip() or extracted.get("authorization", "")
+    user_agent = form_value(form, "user_agent").strip() or extracted.get("user-agent", "")
+    referer = form_value(form, "referer").strip() or extracted.get("referer", "")
+    accept_language = form_value(form, "accept_language").strip() or extracted.get("accept-language", "")
     return {
         **existing,
         "id": site_id,
@@ -130,7 +139,12 @@ def normalize_site(form: dict[str, list[str]], existing: dict[str, Any] | None =
         "name": form_value(form, "name").strip(),
         "url": form_value(form, "url").strip(),
         "check_url": form_value(form, "check_url").strip(),
-        "cookie": form_value(form, "cookie").strip(),
+        "request_headers": request_headers,
+        "cookie": cookie,
+        "authorization": authorization,
+        "user_agent": user_agent,
+        "referer": referer,
+        "accept_language": accept_language,
         "success_keywords": form_value(form, "success_keywords").strip(),
         "failure_keywords": form_value(form, "failure_keywords").strip(),
         "interval_hours": interval_hours,
@@ -145,27 +159,87 @@ def form_value(form: dict[str, list[str]], name: str, default: str = "") -> str:
     return values[0]
 
 
+def parse_request_headers(raw: str) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if not raw.strip():
+        return headers
+
+    def add_header(line: str) -> None:
+        if ":" not in line:
+            return
+        name, value = line.split(":", 1)
+        name = name.strip().lower()
+        value = value.strip()
+        if name and value:
+            headers[name] = value
+
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        parts = []
+    if parts and parts[0].lower() == "curl":
+        idx = 1
+        while idx < len(parts):
+            part = parts[idx]
+            if part in {"-H", "--header"} and idx + 1 < len(parts):
+                add_header(parts[idx + 1])
+                idx += 2
+                continue
+            if part in {"-A", "--user-agent"} and idx + 1 < len(parts):
+                headers["user-agent"] = parts[idx + 1]
+                idx += 2
+                continue
+            if part in {"-e", "--referer"} and idx + 1 < len(parts):
+                headers["referer"] = parts[idx + 1]
+                idx += 2
+                continue
+            idx += 1
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    for line in lines:
+        add_header(line)
+
+    known = {
+        "cookie",
+        "authorization",
+        "user-agent",
+        "referer",
+        "accept-language",
+    }
+    for idx, line in enumerate(lines[:-1]):
+        key = line.rstrip(":").strip().lower()
+        if key in known and key not in headers and ":" not in line:
+            headers[key] = lines[idx + 1].strip()
+    return headers
+
+
 def check_site(site: dict[str, Any]) -> CheckResult:
     cookie = str(site.get("cookie") or "").strip()
-    if not cookie:
-        return CheckResult("missing_cookie", "未填写 Cookie")
+    authorization = str(site.get("authorization") or "").strip()
+    if not cookie and not authorization:
+        return CheckResult("missing_auth", "未填写 Cookie 或 Authorization")
 
     check_url = str(site.get("check_url") or site.get("url") or "").strip()
     if not check_url:
         return CheckResult("bad_config", "未填写检测地址")
 
     session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": os.getenv(
-                "USER_AGENT",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-            ),
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
-            "Cookie": cookie,
-        }
-    )
+    headers = {
+        "User-Agent": str(site.get("user_agent") or os.getenv(
+            "USER_AGENT",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        )).strip(),
+        "Accept-Language": str(site.get("accept_language") or "zh-CN,zh;q=0.9,en;q=0.7").strip(),
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    if authorization:
+        headers["Authorization"] = authorization
+    referer = str(site.get("referer") or "").strip()
+    if referer:
+        headers["Referer"] = referer
+    session.headers.update(headers)
 
     timeout = as_int(os.getenv("REQUEST_TIMEOUT"), 30)
     try:
@@ -232,7 +306,7 @@ def notify_if_needed(data: dict[str, Any], site: dict[str, Any], result: CheckRe
     title = ""
     body = ""
     key = ""
-    if result.status in {"logged_out", "missing_cookie", "error", "unknown"}:
+    if result.status in {"logged_out", "missing_auth", "missing_cookie", "error", "unknown"}:
         title = f"[{APP_NAME}] {site.get('name')} 登录状态异常"
         body = f"站点：{site.get('name')}\n状态：{result.status}\n原因：{result.message}\n检测地址：{site.get('check_url') or site.get('url')}"
         key = f"bad:{result.status}:{result.message}"
@@ -260,6 +334,7 @@ def notify_if_needed(data: dict[str, Any], site: dict[str, Any], result: CheckRe
 
 def send_notifications(settings: dict[str, Any], title: str, body: str) -> None:
     webhook = str(settings.get("webhook_url") or os.getenv("NOTIFY_WEBHOOK_URL") or "").strip()
+    wecom_robot = str(settings.get("wecom_robot_webhook") or os.getenv("WECOM_ROBOT_WEBHOOK") or "").strip()
     sendkey = str(settings.get("serverchan_sendkey") or os.getenv("SERVERCHAN_SENDKEY") or "").strip()
     pushplus_token = str(settings.get("pushplus_token") or os.getenv("PUSHPLUS_TOKEN") or "").strip()
 
@@ -268,6 +343,22 @@ def send_notifications(settings: dict[str, Any], title: str, body: str) -> None:
             requests.post(webhook, json={"title": title, "text": body}, timeout=15)
         except Exception as exc:
             logging.warning("Webhook notify failed: %s", exc)
+
+    if wecom_robot:
+        try:
+            resp = requests.post(
+                wecom_robot,
+                json={"msgtype": "text", "text": {"content": f"{title}\n\n{body}"}},
+                timeout=15,
+            )
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {}
+            if resp.status_code >= 400 or (isinstance(payload, dict) and payload.get("errcode") not in (None, 0)):
+                logging.warning("WeCom robot notify failed: status=%s body=%s", resp.status_code, resp.text[:300])
+        except Exception as exc:
+            logging.warning("WeCom robot notify failed: %s", exc)
 
     if sendkey:
         try:
@@ -299,6 +390,21 @@ def run_check_for_site(site_id: str) -> CheckResult | None:
         return result
 
 
+def run_check_ids(site_ids: list[str]) -> None:
+    for site_id in dict.fromkeys(x for x in site_ids if x):
+        try:
+            result = run_check_for_site(site_id)
+            if result:
+                logging.info("Checked site_id=%s status=%s message=%s", site_id, result.status, result.message)
+        except Exception:
+            logging.exception("Check failed site_id=%s", site_id)
+
+
+def trigger_check_ids(site_ids: list[str]) -> None:
+    thread = threading.Thread(target=run_check_ids, args=(site_ids,), name="manual-check", daemon=True)
+    thread.start()
+
+
 def scheduler_loop() -> None:
     logging.info("Scheduler started")
     while True:
@@ -317,13 +423,7 @@ def scheduler_loop() -> None:
                 if site_due(site, current):
                     check_ids.append(site.get("id"))
 
-        for site_id in dict.fromkeys(x for x in check_ids if x):
-            try:
-                result = run_check_for_site(site_id)
-                if result:
-                    logging.info("Checked site_id=%s status=%s message=%s", site_id, result.status, result.message)
-            except Exception:
-                logging.exception("Check failed site_id=%s", site_id)
+        run_check_ids(check_ids)
 
         time.sleep(max(as_int(os.getenv("CHECK_INTERVAL_SECONDS"), 300), 30))
 
@@ -371,6 +471,8 @@ def render_page(message: str = "") -> str:
       </div>
       <label>通用 Webhook URL</label>
       <input name="webhook_url" value="{esc(settings.get("webhook_url", ""))}" placeholder="可选，POST JSON: title/text">
+      <label>企业微信机器人 / 微信转发 Webhook</label>
+      <input name="wecom_robot_webhook" value="{esc(settings.get("wecom_robot_webhook", ""))}" placeholder="可选，例如 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=... 或你的转发地址">
       <label>Server 酱 SendKey</label>
       <input name="serverchan_sendkey" value="{esc(settings.get("serverchan_sendkey", ""))}" placeholder="可选">
       <label>PushPlus Token</label>
@@ -390,6 +492,7 @@ def render_site_row(site: dict[str, Any]) -> str:
         "never": "neutral",
         "unknown": "warn",
         "logged_out": "bad",
+        "missing_auth": "bad",
         "missing_cookie": "bad",
         "error": "bad",
         "bad_config": "bad",
@@ -450,8 +553,24 @@ def render_site_form(site: dict[str, Any] | None = None, message: str = "") -> s
       </div>
       <label>检测地址</label>
       <input name="check_url" value="{esc(site.get("check_url", ""))}" placeholder="建议填用户中心/控制面板地址；留空则使用首页">
+      <label>请求头或 cURL</label>
+      <textarea name="request_headers" placeholder="可直接粘贴 Copy as cURL，或粘贴 Request Headers；保存时会自动提取 Cookie / Authorization / User-Agent">{esc(site.get("request_headers", ""))}</textarea>
       <label>Cookie</label>
-      <textarea name="cookie" required placeholder="从浏览器开发者工具复制该 PT 站 Cookie 请求头">{esc(site.get("cookie", ""))}</textarea>
+      <textarea name="cookie" placeholder="可手动填写 Cookie；如果上面粘贴了 cURL/请求头，这里可留空自动提取">{esc(site.get("cookie", ""))}</textarea>
+      <label>Authorization</label>
+      <textarea name="authorization" placeholder="可选，例如 Bearer xxx；如果请求头里有 authorization，会自动提取">{esc(site.get("authorization", ""))}</textarea>
+      <div class="grid">
+        <div>
+          <label>User-Agent</label>
+          <input name="user_agent" value="{esc(site.get("user_agent", ""))}" placeholder="可选，建议从请求头自动提取">
+        </div>
+        <div>
+          <label>Referer</label>
+          <input name="referer" value="{esc(site.get("referer", ""))}" placeholder="可选">
+        </div>
+      </div>
+      <label>Accept-Language</label>
+      <input name="accept_language" value="{esc(site.get("accept_language", ""))}" placeholder="可选，默认 zh-CN,zh;q=0.9,en;q=0.7">
       <div class="grid">
         <div>
           <label>检测间隔小时</label>
@@ -605,6 +724,7 @@ class Handler(BaseHTTPRequestHandler):
                 settings["warn_days"] = max(as_int(form_value(form, "warn_days"), 7), 0)
                 settings["notify_cooldown_hours"] = max(as_int(form_value(form, "notify_cooldown_hours"), 12), 1)
                 settings["webhook_url"] = form_value(form, "webhook_url").strip()
+                settings["wecom_robot_webhook"] = form_value(form, "wecom_robot_webhook").strip()
                 settings["serverchan_sendkey"] = form_value(form, "serverchan_sendkey").strip()
                 settings["pushplus_token"] = form_value(form, "pushplus_token").strip()
                 save_config(data)
@@ -641,11 +761,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/check":
             site_id = form_value(form, "id")
             if site_id:
-                RUN_SITE_EVENTS.add(site_id)
+                trigger_check_ids([site_id])
             self._redirect("/?checked=1")
             return
         if self.path == "/check-all":
-            RUN_ALL_EVENT.set()
+            with STATE_LOCK:
+                data = load_config()
+                site_ids = [site.get("id") for site in data.get("sites", []) if site.get("enabled", True)]
+            trigger_check_ids(site_ids)
             self._redirect("/?checked=1")
             return
         self.send_response(404)
