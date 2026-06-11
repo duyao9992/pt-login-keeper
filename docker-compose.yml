@@ -1,0 +1,20 @@
+services:
+  pt-login-keeper:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: 0mwf6jyw7uafdy.xuanyuan.run/library/python:3.12-slim
+    image: pt-login-keeper:latest
+    container_name: pt-login-keeper
+    restart: unless-stopped
+    environment:
+      CONFIG_DIR: /config
+      APP_HOST: 0.0.0.0
+      APP_PORT: "9199"
+      CHECK_INTERVAL_SECONDS: "300"
+      WEB_USER: ""
+      WEB_PASSWORD: ""
+    ports:
+      - "9199:9199"
+    volumes:
+      - ./config:/config
