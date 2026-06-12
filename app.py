@@ -37,6 +37,7 @@ class CheckResult:
     message: str
     http_status: int | None = None
     final_url: str = ""
+    stats: dict[str, Any] | None = None
 
 
 def config_dir() -> Path:
@@ -125,8 +126,10 @@ def get_site(data: dict[str, Any], site_id: str) -> dict[str, Any] | None:
 def normalize_site(form: dict[str, list[str]], existing: dict[str, Any] | None = None) -> dict[str, Any]:
     existing = dict(existing or {})
     site_id = form_value(form, "id") or existing.get("id") or uuid.uuid4().hex[:12]
-    interval_hours = max(as_int(form_value(form, "interval_hours"), 168), 1)
+    interval_hours = max(as_int(form_value(form, "interval_hours"), 600), 1)
     expire_days = max(as_int(form_value(form, "expire_days"), 30), 1)
+    stats_report_interval_days = max(as_int(form_value(form, "stats_report_interval_days"), 25), 1)
+    manual_login_reminder_days = max(as_int(form_value(form, "manual_login_reminder_days"), 30), 1)
     request_headers = form_value(form, "request_headers").strip()
     extracted = parse_request_headers(request_headers)
     cookie = form_value(form, "cookie").strip() or extracted.get("cookie", "")
@@ -140,9 +143,16 @@ def normalize_site(form: dict[str, list[str]], existing: dict[str, Any] | None =
     mteam_sign = "mteam_sign" in form
     if "mteam_sign_present" not in form and existing and "mteam_sign" in existing:
         mteam_sign = as_bool(existing.get("mteam_sign"), False)
+    stats_report_enabled = "stats_report_enabled" in form
+    if "stats_report_enabled_present" not in form:
+        stats_report_enabled = as_bool(existing.get("stats_report_enabled"), True)
+    manual_login_reminder_enabled = "manual_login_reminder_enabled" in form
+    if "manual_login_reminder_enabled_present" not in form:
+        manual_login_reminder_enabled = as_bool(existing.get("manual_login_reminder_enabled"), True)
     return {
         **existing,
         "id": site_id,
+        "created_at": existing.get("created_at") or now_ts(),
         "enabled": "enabled" in form,
         "name": form_value(form, "name").strip(),
         "url": form_value(form, "url").strip(),
@@ -173,6 +183,10 @@ def normalize_site(form: dict[str, list[str]], existing: dict[str, Any] | None =
         "failure_keywords": form_value(form, "failure_keywords").strip(),
         "interval_hours": interval_hours,
         "expire_days": expire_days,
+        "stats_report_enabled": stats_report_enabled,
+        "stats_report_interval_days": stats_report_interval_days,
+        "manual_login_reminder_enabled": manual_login_reminder_enabled,
+        "manual_login_reminder_days": manual_login_reminder_days,
     }
 
 
@@ -249,6 +263,139 @@ def make_mteam_signature(url: str, method: str, timestamp: str) -> str:
     return base64.b64encode(digest).decode("ascii")
 
 
+def format_bytes_value(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    unit_idx = 0
+    while size >= 1024 and unit_idx < len(units) - 1:
+        size /= 1024
+        unit_idx += 1
+    if unit_idx == 0:
+        return f"{int(size)} {units[unit_idx]}"
+    return f"{size:.2f} {units[unit_idx]}"
+
+
+def format_number_value(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        number = float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return str(value)
+    if number.is_integer():
+        return f"{int(number):,}"
+    return f"{number:,.2f}".rstrip("0").rstrip(".")
+
+
+def format_ratio_value(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        return f"{float(value):.3f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def first_present(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+def extract_json_site_stats(text: str) -> dict[str, str]:
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return {}
+    member_count = data.get("memberCount")
+    if not isinstance(member_count, dict):
+        member_count = data.get("member_count") if isinstance(data.get("member_count"), dict) else {}
+    member_status = data.get("memberStatus")
+    if not isinstance(member_status, dict):
+        member_status = data.get("member_status") if isinstance(data.get("member_status"), dict) else {}
+
+    stats = {
+        "username": str(first_present(data.get("username"), data.get("name"), data.get("userName"))),
+        "uploaded": format_bytes_value(first_present(member_count.get("uploaded"), data.get("uploaded"))),
+        "downloaded": format_bytes_value(first_present(member_count.get("downloaded"), data.get("downloaded"))),
+        "share_rate": format_ratio_value(first_present(member_count.get("shareRate"), data.get("shareRate"), data.get("ratio"))),
+        "bonus": format_number_value(first_present(member_count.get("bonus"), data.get("bonus"))),
+        "last_login": str(first_present(member_status.get("lastLogin"), data.get("lastLogin"))),
+        "last_browse": str(first_present(member_status.get("lastBrowse"), data.get("lastBrowse"))),
+    }
+    return {key: value for key, value in stats.items() if value}
+
+
+def extract_html_site_stats(text: str) -> dict[str, str]:
+    plain = re.sub(r"<[^>]+>", " ", text)
+    plain = html.unescape(re.sub(r"\s+", " ", plain))
+
+    def find_value(patterns: list[str]) -> str:
+        for pattern in patterns:
+            match = re.search(pattern, plain, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    uploaded = find_value([
+        r"(?:上传量|已上传|Uploaded)\s*[:：]?\s*([0-9.,]+\s*(?:[KMGTPE]i?B|[KMGTPE]B|TB|GB|MB|KB|B))",
+    ])
+    downloaded = find_value([
+        r"(?:下载量|已下载|Downloaded)\s*[:：]?\s*([0-9.,]+\s*(?:[KMGTPE]i?B|[KMGTPE]B|TB|GB|MB|KB|B))",
+    ])
+    share_rate = find_value([
+        r"(?:分享率|分享比率|Share\s*Ratio|Ratio)\s*[:：]?\s*([0-9.,]+)",
+    ])
+    bonus = find_value([
+        r"(?:魔力|魔力值|积分|Bonus)\s*[:：]?\s*([0-9.,]+)",
+    ])
+    stats = {
+        "uploaded": uploaded,
+        "downloaded": downloaded,
+        "share_rate": share_rate,
+        "bonus": bonus,
+    }
+    return {key: value for key, value in stats.items() if value}
+
+
+def extract_site_stats(text: str) -> dict[str, str]:
+    stats = extract_json_site_stats(text)
+    if stats:
+        return stats
+    return extract_html_site_stats(text)
+
+
+def build_stats_report_body(site: dict[str, Any], stats: dict[str, Any]) -> str:
+    lines = [f"站点：{site.get('name')}"]
+    if stats.get("username"):
+        lines.append(f"用户：{stats.get('username')}")
+    if stats.get("uploaded"):
+        lines.append(f"上传量：{stats.get('uploaded')}")
+    if stats.get("downloaded"):
+        lines.append(f"下载量：{stats.get('downloaded')}")
+    if stats.get("share_rate"):
+        lines.append(f"分享率：{stats.get('share_rate')}")
+    if stats.get("bonus"):
+        lines.append(f"魔力/积分：{stats.get('bonus')}")
+    if stats.get("last_login"):
+        lines.append(f"站点记录上次登录：{stats.get('last_login')}")
+    if stats.get("last_browse"):
+        lines.append(f"站点记录上次浏览：{stats.get('last_browse')}")
+    lines.append(f"检测时间：{format_time(now_ts())}")
+    return "\n".join(lines)
+
+
 def check_site(site: dict[str, Any]) -> CheckResult:
     cookie = str(site.get("cookie") or "").strip()
     authorization = str(site.get("authorization") or "").strip()
@@ -315,9 +462,10 @@ def check_site(site: dict[str, Any]) -> CheckResult:
         return CheckResult("error", f"请求失败：{exc.__class__.__name__}: {exc}")
 
     text = resp.text or ""
+    stats = extract_site_stats(text)
     final_url = resp.url
     if resp.status_code >= 400:
-        return CheckResult("error", f"HTTP {resp.status_code}", resp.status_code, final_url)
+        return CheckResult("error", f"HTTP {resp.status_code}", resp.status_code, final_url, stats or None)
 
     failure_keywords = split_lines(site.get("failure_keywords") or DEFAULT_FAILURE_KEYWORDS)
     success_keywords = split_lines(site.get("success_keywords") or DEFAULT_SUCCESS_KEYWORDS)
@@ -327,24 +475,28 @@ def check_site(site: dict[str, Any]) -> CheckResult:
     for keyword in failure_keywords:
         lowered = keyword.lower()
         if lowered and (lowered in lowered_text or lowered in lowered_url):
-            return CheckResult("logged_out", f"命中失效关键词：{keyword}", resp.status_code, final_url)
+            return CheckResult("logged_out", f"命中失效关键词：{keyword}", resp.status_code, final_url, stats or None)
 
     if success_keywords:
         for keyword in success_keywords:
             if keyword and keyword.lower() in lowered_text:
-                return CheckResult("ok", f"登录有效，命中关键词：{keyword}", resp.status_code, final_url)
-        return CheckResult("unknown", "未命中成功关键词，需要调整检测关键词", resp.status_code, final_url)
+                return CheckResult("ok", f"登录有效，命中关键词：{keyword}", resp.status_code, final_url, stats or None)
+        return CheckResult("unknown", "未命中成功关键词，需要调整检测关键词", resp.status_code, final_url, stats or None)
 
-    return CheckResult("ok", "HTTP 正常，未配置成功关键词", resp.status_code, final_url)
+    return CheckResult("ok", "HTTP 正常，未配置成功关键词", resp.status_code, final_url, stats or None)
 
 
 def update_site_after_check(site: dict[str, Any], result: CheckResult) -> None:
     current = now_ts()
+    site.setdefault("created_at", current)
     site["last_checked"] = current
     site["last_status"] = result.status
     site["last_message"] = result.message
     site["last_http_status"] = result.http_status
     site["last_final_url"] = result.final_url
+    if result.stats:
+        site["last_stats"] = result.stats
+        site["last_stats_at"] = current
     if result.status == "ok":
         site["last_success"] = current
 
@@ -353,7 +505,7 @@ def site_due(site: dict[str, Any], current: int) -> bool:
     if not site.get("enabled", True):
         return False
     last_checked = as_int(site.get("last_checked"), 0)
-    interval_seconds = max(as_int(site.get("interval_hours"), 168), 1) * 3600
+    interval_seconds = max(as_int(site.get("interval_hours"), 600), 1) * 3600
     return current - last_checked >= interval_seconds
 
 
@@ -364,7 +516,59 @@ def days_since(ts: Any) -> float | None:
     return max((now_ts() - value) / 86400, 0)
 
 
+def notify_stats_report_if_needed(data: dict[str, Any], site: dict[str, Any], result: CheckResult) -> None:
+    if result.status != "ok" or not result.stats:
+        return
+    if not as_bool(site.get("stats_report_enabled"), True):
+        return
+    interval_seconds = max(as_int(site.get("stats_report_interval_days"), 25), 1) * 86400
+    current = now_ts()
+    last_report_at = as_int(site.get("last_stats_report_at"), 0)
+    if last_report_at and current - last_report_at < interval_seconds:
+        return
+
+    settings = data.get("settings", {})
+    title = f"[{APP_NAME}] {site.get('name')} 上传下载数据"
+    body = build_stats_report_body(site, result.stats)
+    send_notifications(settings, title, body)
+    site["last_stats_report_at"] = current
+
+
+def notify_manual_login_if_needed(data: dict[str, Any], site: dict[str, Any], result: CheckResult) -> None:
+    if result.status != "ok":
+        return
+    if not as_bool(site.get("manual_login_reminder_enabled"), True):
+        return
+    reminder_days = max(as_int(site.get("manual_login_reminder_days"), 30), 1)
+    last_manual_login_at = as_int(site.get("last_manual_login_at"), 0)
+    if not last_manual_login_at:
+        last_manual_login_at = as_int(site.get("created_at"), 0) or as_int(site.get("last_success"), 0)
+    if not last_manual_login_at:
+        return
+    current = now_ts()
+    if current - last_manual_login_at < reminder_days * 86400:
+        return
+    cooldown = max(as_int(data.get("settings", {}).get("notify_cooldown_hours"), 12), 1) * 3600
+    last_at = as_int(site.get("last_manual_login_notify_at"), 0)
+    if current - last_at < cooldown:
+        return
+
+    settings = data.get("settings", {})
+    title = f"[{APP_NAME}] {site.get('name')} 需要手动网页登录"
+    body = (
+        f"站点：{site.get('name')}\n"
+        f"距离上次记录的手动网页登录已经约 {days_since(last_manual_login_at) or 0:.1f} 天。\n"
+        "请用浏览器打开站点并手动登录/刷新一次，完成后回到 PT Login Keeper 点“已手动登录”。\n"
+        "说明：容器检测只能确认当前凭据是否可用，不能保证等同于站点要求的真实网页登录。"
+    )
+    send_notifications(settings, title, body)
+    site["last_manual_login_notify_at"] = current
+
+
 def notify_if_needed(data: dict[str, Any], site: dict[str, Any], result: CheckResult) -> None:
+    notify_stats_report_if_needed(data, site, result)
+    notify_manual_login_if_needed(data, site, result)
+
     settings = data.get("settings", {})
     cooldown = max(as_int(settings.get("notify_cooldown_hours"), 12), 1) * 3600
     warn_days = max(as_int(settings.get("warn_days"), 7), 0)
@@ -540,11 +744,15 @@ def render_page(message: str = "") -> str:
       <input name="webhook_url" value="{esc(settings.get("webhook_url", ""))}" placeholder="可选，POST JSON: title/text">
       <label>企业微信机器人 / 微信转发 Webhook</label>
       <input name="wecom_robot_webhook" value="{esc(settings.get("wecom_robot_webhook", ""))}" placeholder="可选，例如 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=... 或你的转发地址">
+      <div class="hint">如果 MoviePilot 已经能推送企业微信，把 MoviePilot 里同一个企业微信机器人 Webhook 复制到这里即可共用。此字段会发送企业微信机器人兼容格式。</div>
       <label>Server 酱 SendKey</label>
       <input name="serverchan_sendkey" value="{esc(settings.get("serverchan_sendkey", ""))}" placeholder="可选">
       <label>PushPlus Token</label>
       <input name="pushplus_token" value="{esc(settings.get("pushplus_token", ""))}" placeholder="可选">
       <div class="row submit-row"><button class="primary" type="submit">保存通知设置</button></div>
+    </form>
+    <form method="post" action="/test-notify" class="test-form">
+      <button class="secondary" type="submit">发送测试通知</button>
     </form>
   </section>
 """,
@@ -570,6 +778,21 @@ def render_site_row(site: dict[str, Any]) -> str:
         left = "-"
     else:
         left = f"{max(expire_days - elapsed, 0):.1f} 天"
+    stats = site.get("last_stats") if isinstance(site.get("last_stats"), dict) else {}
+    stats_bits = []
+    if stats.get("uploaded"):
+        stats_bits.append(f"上传 {stats.get('uploaded')}")
+    if stats.get("downloaded"):
+        stats_bits.append(f"下载 {stats.get('downloaded')}")
+    if stats.get("share_rate"):
+        stats_bits.append(f"分享率 {stats.get('share_rate')}")
+    stats_text = " / ".join(stats_bits)
+    message_parts = [str(site.get("last_message", ""))]
+    if stats_text:
+        message_parts.append(f"数据：{stats_text}")
+    if site.get("last_stats_at"):
+        message_parts.append(f"数据时间：{format_time(site.get('last_stats_at'))}")
+    message_text = "\n".join(part for part in message_parts if part)
     return f"""
       <tr>
         <td><b>{esc(site.get("name"))}</b><div class="muted">{esc(site.get("check_url") or site.get("url"))}</div></td>
@@ -577,11 +800,12 @@ def render_site_row(site: dict[str, Any]) -> str:
         <td>{esc(format_time(site.get("last_success")))}</td>
         <td>{esc(format_time(site.get("last_checked")))}</td>
         <td>{esc(left)}</td>
-        <td>{esc(site.get("interval_hours", 168))} 小时</td>
-        <td class="message-cell">{esc(site.get("last_message", ""))}</td>
+        <td>{esc(site.get("interval_hours", 600))} 小时</td>
+        <td class="message-cell">{esc(message_text)}</td>
         <td>
           <div class="actions">
             <form method="post" action="/check"><input type="hidden" name="id" value="{esc(site.get("id"))}"><button class="small" type="submit">检测</button></form>
+            <form method="post" action="/mark-manual-login"><input type="hidden" name="id" value="{esc(site.get("id"))}"><button class="small" type="submit">已手动登录</button></form>
             <a class="small link-button" href="/site?id={esc(site.get("id"))}">编辑</a>
             <form method="post" action="/delete" onsubmit="return confirm('确认删除？')"><input type="hidden" name="id" value="{esc(site.get("id"))}"><button class="small danger" type="submit">删除</button></form>
           </div>
@@ -593,13 +817,19 @@ def render_site_form(site: dict[str, Any] | None = None, message: str = "") -> s
     site = site or {
         "enabled": True,
         "check_method": "GET",
-        "interval_hours": 168,
+        "interval_hours": 600,
         "expire_days": 30,
+        "stats_report_enabled": True,
+        "stats_report_interval_days": 25,
+        "manual_login_reminder_enabled": True,
+        "manual_login_reminder_days": 30,
         "success_keywords": DEFAULT_SUCCESS_KEYWORDS,
         "failure_keywords": DEFAULT_FAILURE_KEYWORDS,
     }
     checked = "checked" if site.get("enabled", True) else ""
     mteam_checked = "checked" if as_bool(site.get("mteam_sign"), False) else ""
+    stats_report_checked = "checked" if as_bool(site.get("stats_report_enabled"), True) else ""
+    manual_login_reminder_checked = "checked" if as_bool(site.get("manual_login_reminder_enabled"), True) else ""
     get_selected = "selected" if str(site.get("check_method") or "GET").upper() == "GET" else ""
     post_selected = "selected" if str(site.get("check_method") or "").upper() == "POST" else ""
     message_html = f"<div class='message'>{esc(message)}</div>" if message else ""
@@ -679,13 +909,37 @@ def render_site_form(site: dict[str, Any] | None = None, message: str = "") -> s
       <div class="grid">
         <div>
           <label>检测间隔小时</label>
-          <input name="interval_hours" value="{esc(site.get("interval_hours", 168))}">
+          <input name="interval_hours" value="{esc(site.get("interval_hours", 600))}">
+          <div class="hint">25 天 = 600 小时。每到间隔会自动检测一次登录状态。</div>
         </div>
         <div>
           <label>保号天数</label>
           <input name="expire_days" value="{esc(site.get("expire_days", 30))}">
         </div>
       </div>
+      <div class="grid">
+        <div>
+          <label>上传下载数据通知</label>
+          <input type="hidden" name="stats_report_enabled_present" value="1">
+          <label class="inline option-line"><input type="checkbox" name="stats_report_enabled" value="1" {stats_report_checked}> 检测成功后定期发送上传量、下载量、分享率</label>
+        </div>
+        <div>
+          <label>数据通知间隔天数</label>
+          <input name="stats_report_interval_days" value="{esc(site.get("stats_report_interval_days", 25))}">
+        </div>
+      </div>
+      <div class="grid">
+        <div>
+          <label>手动网页登录提醒</label>
+          <input type="hidden" name="manual_login_reminder_enabled_present" value="1">
+          <label class="inline option-line"><input type="checkbox" name="manual_login_reminder_enabled" value="1" {manual_login_reminder_checked}> 定期提醒你用浏览器手动登录一次</label>
+        </div>
+        <div>
+          <label>手动登录提醒天数</label>
+          <input name="manual_login_reminder_days" value="{esc(site.get("manual_login_reminder_days", 30))}">
+        </div>
+      </div>
+      <div class="hint">推荐：检测间隔 600 小时，数据通知间隔 25 天，手动网页登录提醒 30 天。完成手动网页登录后，在首页点该站点的“已手动登录”。</div>
       <label>成功关键词</label>
       <textarea name="success_keywords">{esc(site.get("success_keywords") or DEFAULT_SUCCESS_KEYWORDS)}</textarea>
       <div class="hint">检测页面包含任意成功关键词即认为仍处于登录状态。建议用“退出、用户中心、上传量、魔力”等登录后才出现的词。</div>
@@ -721,6 +975,7 @@ def page_shell(content: str, title: str) -> str:
     .row {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
     .grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }}
     .submit-row {{ margin-top:18px; }}
+    .test-form {{ margin-top:10px; }}
     label {{ display:block; font-weight:650; margin:16px 0 8px; }}
     label.inline {{ display:flex; gap:8px; align-items:center; margin-top:0; }}
     .option-line {{ min-height:40px; }}
@@ -741,7 +996,7 @@ def page_shell(content: str, title: str) -> str:
     .bad {{ background:#fee2e2; color:#991b1b; }}
     .neutral {{ background:#e5e7eb; color:#374151; }}
     .message {{ background:#ecfdf3; border:1px solid #bbf7d0; color:#166534; padding:10px 12px; border-radius:7px; margin:14px 0; }}
-    .message-cell {{ max-width:260px; word-break:break-word; }}
+    .message-cell {{ max-width:260px; word-break:break-word; white-space:pre-line; }}
     @media (max-width:720px) {{ .grid {{ grid-template-columns:1fr; }} table {{ font-size:13px; }} }}
   </style>
 </head>
@@ -817,6 +1072,10 @@ class Handler(BaseHTTPRequestHandler):
             message = "已请求检测"
         if "deleted=1" in parsed.query:
             message = "已删除"
+        if "notify_test=1" in parsed.query:
+            message = "已发送测试通知"
+        if "manual_login_marked=1" in parsed.query:
+            message = "已记录手动网页登录时间"
         self._send_html(render_page(message))
 
     def do_POST(self) -> None:
@@ -835,6 +1094,15 @@ class Handler(BaseHTTPRequestHandler):
                 settings["pushplus_token"] = form_value(form, "pushplus_token").strip()
                 save_config(data)
             self._redirect("/?saved=1")
+            return
+        if self.path == "/test-notify":
+            settings = load_config().get("settings", {})
+            send_notifications(
+                settings,
+                f"[{APP_NAME}] 测试通知",
+                "如果你收到这条消息，说明 PT Login Keeper 的微信通知配置正常。",
+            )
+            self._redirect("/?notify_test=1")
             return
         if self.path == "/site":
             with STATE_LOCK:
@@ -855,6 +1123,18 @@ class Handler(BaseHTTPRequestHandler):
                     sites.append(site)
                 save_config(data)
             self._redirect("/?saved=1")
+            return
+        if self.path == "/mark-manual-login":
+            site_id = form_value(form, "id")
+            with STATE_LOCK:
+                data = load_config()
+                site = get_site(data, site_id)
+                if site is not None:
+                    current = now_ts()
+                    site["last_manual_login_at"] = current
+                    site["last_manual_login_notify_at"] = 0
+                    save_config(data)
+            self._redirect("/?manual_login_marked=1")
             return
         if self.path == "/delete":
             site_id = form_value(form, "id")
