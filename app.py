@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 
@@ -401,6 +401,15 @@ def build_stats_report_body(site: dict[str, Any], stats: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def adapt_wecom_url(base_url: str, endpoint: str) -> str:
+    base = base_url.strip() or "https://qyapi.weixin.qq.com"
+    if not base.endswith("/"):
+        base += "/"
+    if not base.startswith(("http://", "https://")):
+        base = "http://" + base
+    return urljoin(base, endpoint)
+
+
 def check_site(site: dict[str, Any]) -> CheckResult:
     cookie = str(site.get("cookie") or "").strip()
     authorization = str(site.get("authorization") or "").strip()
@@ -643,11 +652,10 @@ def send_notifications(settings: dict[str, Any], title: str, body: str) -> None:
 
     if wecom_app_corpid and wecom_app_agentid and wecom_app_secret:
         try:
-            proxies = {"http": wecom_app_proxy, "https": wecom_app_proxy} if wecom_app_proxy else None
+            wecom_base_url = wecom_app_proxy or "https://qyapi.weixin.qq.com"
             token_resp = requests.get(
-                "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+                adapt_wecom_url(wecom_base_url, "cgi-bin/gettoken"),
                 params={"corpid": wecom_app_corpid, "corpsecret": wecom_app_secret},
-                proxies=proxies,
                 timeout=15,
             )
             token_payload = token_resp.json()
@@ -660,7 +668,7 @@ def send_notifications(settings: dict[str, Any], title: str, body: str) -> None:
                 except ValueError:
                     agentid = wecom_app_agentid
                 resp = requests.post(
-                    "https://qyapi.weixin.qq.com/cgi-bin/message/send",
+                    adapt_wecom_url(wecom_base_url, "cgi-bin/message/send"),
                     params={"access_token": access_token},
                     json={
                         "touser": wecom_app_touser,
@@ -669,7 +677,6 @@ def send_notifications(settings: dict[str, Any], title: str, body: str) -> None:
                         "text": {"content": f"{title}\n\n{body}"},
                         "safe": 0,
                     },
-                    proxies=proxies,
                     timeout=15,
                 )
                 try:
@@ -679,7 +686,7 @@ def send_notifications(settings: dict[str, Any], title: str, body: str) -> None:
                 if resp.status_code >= 400 or (isinstance(payload, dict) and payload.get("errcode") not in (None, 0)):
                     logging.warning("WeCom app notify failed: status=%s body=%s", resp.status_code, resp.text[:300])
         except Exception as exc:
-            logging.warning("WeCom app notify failed: %s", exc)
+            logging.warning("WeCom app notify failed: %s", exc.__class__.__name__)
 
     if sendkey:
         try:
@@ -812,7 +819,7 @@ def render_page(message: str = "") -> str:
       <label>接收用户</label>
       <input name="wecom_app_touser" value="{esc(settings.get("wecom_app_touser", "@all"))}" placeholder="@all">
       <label>企业微信代理</label>
-      <input name="wecom_app_proxy" value="{esc(settings.get("wecom_app_proxy", ""))}" placeholder="可选，例如 http://1.2.3.4:9080；用于解决企业微信可信 IP 限制">
+      <input name="wecom_app_proxy" value="{esc(settings.get("wecom_app_proxy", ""))}" placeholder="可选，例如 http://1.2.3.4:9080；按 MoviePilot 的 WECHAT_PROXY 方式转发企业微信 API">
       <label>Server 酱 SendKey</label>
       <input name="serverchan_sendkey" value="{esc(settings.get("serverchan_sendkey", ""))}" placeholder="可选">
       <label>PushPlus Token</label>
