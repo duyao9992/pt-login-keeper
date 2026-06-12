@@ -165,6 +165,7 @@ accept-language
 应用 AgentId：MoviePilot 的 WECHAT_APP_ID
 应用 Secret：MoviePilot 的 WECHAT_APP_SECRET
 接收用户：默认 @all
+企业微信代理：MoviePilot 的 WECHAT_PROXY，可选，用于解决企业微信可信 IP 限制
 ```
 
 如果你的转发服务器只接收普通 JSON，则使用“通用 Webhook URL”，工具会发送：

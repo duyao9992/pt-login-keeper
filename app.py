@@ -77,6 +77,7 @@ def load_config() -> dict[str, Any]:
                 "wecom_app_agentid": "",
                 "wecom_app_secret": "",
                 "wecom_app_touser": "@all",
+                "wecom_app_proxy": "",
                 "serverchan_sendkey": "",
                 "pushplus_token": "",
             },
@@ -614,6 +615,7 @@ def send_notifications(settings: dict[str, Any], title: str, body: str) -> None:
     wecom_app_agentid = str(settings.get("wecom_app_agentid") or os.getenv("WECOM_APP_AGENTID") or "").strip()
     wecom_app_secret = str(settings.get("wecom_app_secret") or os.getenv("WECOM_APP_SECRET") or "").strip()
     wecom_app_touser = str(settings.get("wecom_app_touser") or os.getenv("WECOM_APP_TOUSER") or "@all").strip() or "@all"
+    wecom_app_proxy = str(settings.get("wecom_app_proxy") or os.getenv("WECOM_APP_PROXY") or "").strip()
     sendkey = str(settings.get("serverchan_sendkey") or os.getenv("SERVERCHAN_SENDKEY") or "").strip()
     pushplus_token = str(settings.get("pushplus_token") or os.getenv("PUSHPLUS_TOKEN") or "").strip()
 
@@ -641,9 +643,11 @@ def send_notifications(settings: dict[str, Any], title: str, body: str) -> None:
 
     if wecom_app_corpid and wecom_app_agentid and wecom_app_secret:
         try:
+            proxies = {"http": wecom_app_proxy, "https": wecom_app_proxy} if wecom_app_proxy else None
             token_resp = requests.get(
                 "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
                 params={"corpid": wecom_app_corpid, "corpsecret": wecom_app_secret},
+                proxies=proxies,
                 timeout=15,
             )
             token_payload = token_resp.json()
@@ -665,6 +669,7 @@ def send_notifications(settings: dict[str, Any], title: str, body: str) -> None:
                         "text": {"content": f"{title}\n\n{body}"},
                         "safe": 0,
                     },
+                    proxies=proxies,
                     timeout=15,
                 )
                 try:
@@ -806,6 +811,8 @@ def render_page(message: str = "") -> str:
       <input type="password" name="wecom_app_secret" value="{esc(settings.get("wecom_app_secret", ""))}" placeholder="WECHAT_APP_SECRET">
       <label>接收用户</label>
       <input name="wecom_app_touser" value="{esc(settings.get("wecom_app_touser", "@all"))}" placeholder="@all">
+      <label>企业微信代理</label>
+      <input name="wecom_app_proxy" value="{esc(settings.get("wecom_app_proxy", ""))}" placeholder="可选，例如 http://1.2.3.4:9080；用于解决企业微信可信 IP 限制">
       <label>Server 酱 SendKey</label>
       <input name="serverchan_sendkey" value="{esc(settings.get("serverchan_sendkey", ""))}" placeholder="可选">
       <label>PushPlus Token</label>
@@ -1156,6 +1163,7 @@ class Handler(BaseHTTPRequestHandler):
                 settings["wecom_app_agentid"] = form_value(form, "wecom_app_agentid").strip()
                 settings["wecom_app_secret"] = form_value(form, "wecom_app_secret").strip()
                 settings["wecom_app_touser"] = form_value(form, "wecom_app_touser").strip() or "@all"
+                settings["wecom_app_proxy"] = form_value(form, "wecom_app_proxy").strip()
                 settings["serverchan_sendkey"] = form_value(form, "serverchan_sendkey").strip()
                 settings["pushplus_token"] = form_value(form, "pushplus_token").strip()
                 save_config(data)
