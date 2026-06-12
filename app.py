@@ -73,6 +73,10 @@ def load_config() -> dict[str, Any]:
                 "notify_cooldown_hours": 12,
                 "webhook_url": "",
                 "wecom_robot_webhook": "",
+                "wecom_app_corpid": "",
+                "wecom_app_agentid": "",
+                "wecom_app_secret": "",
+                "wecom_app_touser": "@all",
                 "serverchan_sendkey": "",
                 "pushplus_token": "",
             },
@@ -606,6 +610,10 @@ def notify_if_needed(data: dict[str, Any], site: dict[str, Any], result: CheckRe
 def send_notifications(settings: dict[str, Any], title: str, body: str) -> None:
     webhook = str(settings.get("webhook_url") or os.getenv("NOTIFY_WEBHOOK_URL") or "").strip()
     wecom_robot = str(settings.get("wecom_robot_webhook") or os.getenv("WECOM_ROBOT_WEBHOOK") or "").strip()
+    wecom_app_corpid = str(settings.get("wecom_app_corpid") or os.getenv("WECOM_APP_CORPID") or "").strip()
+    wecom_app_agentid = str(settings.get("wecom_app_agentid") or os.getenv("WECOM_APP_AGENTID") or "").strip()
+    wecom_app_secret = str(settings.get("wecom_app_secret") or os.getenv("WECOM_APP_SECRET") or "").strip()
+    wecom_app_touser = str(settings.get("wecom_app_touser") or os.getenv("WECOM_APP_TOUSER") or "@all").strip() or "@all"
     sendkey = str(settings.get("serverchan_sendkey") or os.getenv("SERVERCHAN_SENDKEY") or "").strip()
     pushplus_token = str(settings.get("pushplus_token") or os.getenv("PUSHPLUS_TOKEN") or "").strip()
 
@@ -630,6 +638,43 @@ def send_notifications(settings: dict[str, Any], title: str, body: str) -> None:
                 logging.warning("WeCom robot notify failed: status=%s body=%s", resp.status_code, resp.text[:300])
         except Exception as exc:
             logging.warning("WeCom robot notify failed: %s", exc)
+
+    if wecom_app_corpid and wecom_app_agentid and wecom_app_secret:
+        try:
+            token_resp = requests.get(
+                "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+                params={"corpid": wecom_app_corpid, "corpsecret": wecom_app_secret},
+                timeout=15,
+            )
+            token_payload = token_resp.json()
+            access_token = token_payload.get("access_token") if isinstance(token_payload, dict) else ""
+            if not access_token:
+                logging.warning("WeCom app token failed: status=%s body=%s", token_resp.status_code, token_resp.text[:300])
+            else:
+                try:
+                    agentid: int | str = int(wecom_app_agentid)
+                except ValueError:
+                    agentid = wecom_app_agentid
+                resp = requests.post(
+                    "https://qyapi.weixin.qq.com/cgi-bin/message/send",
+                    params={"access_token": access_token},
+                    json={
+                        "touser": wecom_app_touser,
+                        "msgtype": "text",
+                        "agentid": agentid,
+                        "text": {"content": f"{title}\n\n{body}"},
+                        "safe": 0,
+                    },
+                    timeout=15,
+                )
+                try:
+                    payload = resp.json()
+                except Exception:
+                    payload = {}
+                if resp.status_code >= 400 or (isinstance(payload, dict) and payload.get("errcode") not in (None, 0)):
+                    logging.warning("WeCom app notify failed: status=%s body=%s", resp.status_code, resp.text[:300])
+        except Exception as exc:
+            logging.warning("WeCom app notify failed: %s", exc)
 
     if sendkey:
         try:
@@ -745,6 +790,22 @@ def render_page(message: str = "") -> str:
       <label>企业微信机器人 / 微信转发 Webhook</label>
       <input name="wecom_robot_webhook" value="{esc(settings.get("wecom_robot_webhook", ""))}" placeholder="可选，例如 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=... 或你的转发地址">
       <div class="hint">如果 MoviePilot 已经能推送企业微信，把 MoviePilot 里同一个企业微信机器人 Webhook 复制到这里即可共用。此字段会发送企业微信机器人兼容格式。</div>
+      <h3>企业微信应用通知</h3>
+      <div class="hint">如果 MoviePilot 使用的是企业微信应用通知，而不是机器人 Webhook，可以把 MoviePilot 的 `WECHAT_CORPID`、`WECHAT_APP_ID`、`WECHAT_APP_SECRET` 填到这里。</div>
+      <div class="grid">
+        <div>
+          <label>企业 ID / CorpID</label>
+          <input name="wecom_app_corpid" value="{esc(settings.get("wecom_app_corpid", ""))}" placeholder="WECHAT_CORPID">
+        </div>
+        <div>
+          <label>应用 AgentId</label>
+          <input name="wecom_app_agentid" value="{esc(settings.get("wecom_app_agentid", ""))}" placeholder="WECHAT_APP_ID">
+        </div>
+      </div>
+      <label>应用 Secret</label>
+      <input type="password" name="wecom_app_secret" value="{esc(settings.get("wecom_app_secret", ""))}" placeholder="WECHAT_APP_SECRET">
+      <label>接收用户</label>
+      <input name="wecom_app_touser" value="{esc(settings.get("wecom_app_touser", "@all"))}" placeholder="@all">
       <label>Server 酱 SendKey</label>
       <input name="serverchan_sendkey" value="{esc(settings.get("serverchan_sendkey", ""))}" placeholder="可选">
       <label>PushPlus Token</label>
@@ -969,6 +1030,7 @@ def page_shell(content: str, title: str) -> str:
     main {{ max-width:1120px; margin:0 auto; padding:28px 18px 48px; }}
     h1 {{ margin:0 0 6px; font-size:30px; }}
     h2 {{ margin:0 0 14px; font-size:18px; }}
+    h3 {{ margin:18px 0 8px; font-size:16px; }}
     .sub,.muted,.hint {{ color:#6b7280; }}
     .hint {{ font-size:13px; line-height:1.5; margin-top:6px; }}
     .panel {{ background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:18px; margin:16px 0; }}
@@ -1090,6 +1152,10 @@ class Handler(BaseHTTPRequestHandler):
                 settings["notify_cooldown_hours"] = max(as_int(form_value(form, "notify_cooldown_hours"), 12), 1)
                 settings["webhook_url"] = form_value(form, "webhook_url").strip()
                 settings["wecom_robot_webhook"] = form_value(form, "wecom_robot_webhook").strip()
+                settings["wecom_app_corpid"] = form_value(form, "wecom_app_corpid").strip()
+                settings["wecom_app_agentid"] = form_value(form, "wecom_app_agentid").strip()
+                settings["wecom_app_secret"] = form_value(form, "wecom_app_secret").strip()
+                settings["wecom_app_touser"] = form_value(form, "wecom_app_touser").strip() or "@all"
                 settings["serverchan_sendkey"] = form_value(form, "serverchan_sendkey").strip()
                 settings["pushplus_token"] = form_value(form, "pushplus_token").strip()
                 save_config(data)

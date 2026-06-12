@@ -158,6 +158,15 @@ accept-language
 {"msgtype":"text","text":{"content":"通知内容"}}
 ```
 
+如果 MoviePilot 使用的是“企业微信应用”通知，而不是机器人 Webhook，则填写“企业微信应用通知”区域：
+
+```text
+企业 ID / CorpID：MoviePilot 的 WECHAT_CORPID
+应用 AgentId：MoviePilot 的 WECHAT_APP_ID
+应用 Secret：MoviePilot 的 WECHAT_APP_SECRET
+接收用户：默认 @all
+```
+
 如果你的转发服务器只接收普通 JSON，则使用“通用 Webhook URL”，工具会发送：
 
 ```json
