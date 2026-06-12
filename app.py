@@ -401,6 +401,10 @@ def build_stats_report_body(site: dict[str, Any], stats: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def site_login_url(site: dict[str, Any]) -> str:
+    return str(site.get("url") or site.get("check_url") or "").strip()
+
+
 def adapt_wecom_url(base_url: str, endpoint: str) -> str:
     base = base_url.strip() or "https://qyapi.weixin.qq.com"
     if not base.endswith("/"):
@@ -569,8 +573,11 @@ def notify_manual_login_if_needed(data: dict[str, Any], site: dict[str, Any], re
 
     settings = data.get("settings", {})
     title = f"[{APP_NAME}] {site.get('name')} 需要手动网页登录"
+    login_url = site_login_url(site)
+    login_line = f"网页登录地址：{login_url}\n" if login_url else ""
     body = (
         f"站点：{site.get('name')}\n"
+        f"{login_line}"
         f"距离上次记录的手动网页登录已经约 {days_since(last_manual_login_at) or 0:.1f} 天。\n"
         "请用浏览器打开站点并手动登录/刷新一次，完成后回到 PT Login Keeper 点“已手动登录”。\n"
         "说明：容器检测只能确认当前凭据是否可用，不能保证等同于站点要求的真实网页登录。"
@@ -592,8 +599,10 @@ def notify_if_needed(data: dict[str, Any], site: dict[str, Any], result: CheckRe
     body = ""
     key = ""
     if result.status in {"logged_out", "missing_auth", "missing_cookie", "error", "unknown"}:
+        login_url = site_login_url(site)
+        login_line = f"\n网页登录地址：{login_url}" if login_url else ""
         title = f"[{APP_NAME}] {site.get('name')} 登录状态异常"
-        body = f"站点：{site.get('name')}\n状态：{result.status}\n原因：{result.message}\n检测地址：{site.get('check_url') or site.get('url')}"
+        body = f"站点：{site.get('name')}\n状态：{result.status}\n原因：{result.message}\n检测地址：{site.get('check_url') or site.get('url')}{login_line}"
         key = f"bad:{result.status}:{result.message}"
     elif result.status == "ok":
         elapsed = days_since(site.get("last_success"))
