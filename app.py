@@ -134,7 +134,6 @@ def normalize_site(form: dict[str, list[str]], existing: dict[str, Any] | None =
     interval_hours = max(as_int(form_value(form, "interval_hours"), 600), 1)
     expire_days = max(as_int(form_value(form, "expire_days"), 30), 1)
     stats_report_interval_days = max(as_int(form_value(form, "stats_report_interval_days"), 25), 1)
-    manual_login_reminder_days = max(as_int(form_value(form, "manual_login_reminder_days"), 30), 1)
     request_headers = form_value(form, "request_headers").strip()
     extracted = parse_request_headers(request_headers)
     cookie = form_value(form, "cookie").strip() or extracted.get("cookie", "")
@@ -151,9 +150,6 @@ def normalize_site(form: dict[str, list[str]], existing: dict[str, Any] | None =
     stats_report_enabled = "stats_report_enabled" in form
     if "stats_report_enabled_present" not in form:
         stats_report_enabled = as_bool(existing.get("stats_report_enabled"), True)
-    manual_login_reminder_enabled = "manual_login_reminder_enabled" in form
-    if "manual_login_reminder_enabled_present" not in form:
-        manual_login_reminder_enabled = as_bool(existing.get("manual_login_reminder_enabled"), True)
     return {
         **existing,
         "id": site_id,
@@ -190,8 +186,9 @@ def normalize_site(form: dict[str, list[str]], existing: dict[str, Any] | None =
         "expire_days": expire_days,
         "stats_report_enabled": stats_report_enabled,
         "stats_report_interval_days": stats_report_interval_days,
-        "manual_login_reminder_enabled": manual_login_reminder_enabled,
-        "manual_login_reminder_days": manual_login_reminder_days,
+        # Backward-compatible aliases for older config files; the UI and scheduler now use one 25-day combined reminder.
+        "manual_login_reminder_enabled": stats_report_enabled,
+        "manual_login_reminder_days": stats_report_interval_days,
     }
 
 
@@ -382,7 +379,8 @@ def extract_site_stats(text: str) -> dict[str, str]:
 
 
 def build_stats_report_body(site: dict[str, Any], stats: dict[str, Any]) -> str:
-    lines = [f"站点：{site.get('name')}"]
+    login_url = site_login_url(site)
+    lines = [f"站点：{site.get('name')}", "登录状态：有效"]
     if stats.get("username"):
         lines.append(f"用户：{stats.get('username')}")
     if stats.get("uploaded"):
@@ -397,6 +395,9 @@ def build_stats_report_body(site: dict[str, Any], stats: dict[str, Any]) -> str:
         lines.append(f"站点记录上次登录：{stats.get('last_login')}")
     if stats.get("last_browse"):
         lines.append(f"站点记录上次浏览：{stats.get('last_browse')}")
+    if login_url:
+        lines.append(f"网页登录地址：{login_url}")
+    lines.append("提醒：请点击上面的网页登录地址，用浏览器手动登录/刷新一次。")
     lines.append(f"检测时间：{format_time(now_ts())}")
     return "\n".join(lines)
 
@@ -546,51 +547,15 @@ def notify_stats_report_if_needed(data: dict[str, Any], site: dict[str, Any], re
         return
 
     settings = data.get("settings", {})
-    title = f"[{APP_NAME}] {site.get('name')} 上传下载数据"
+    title = f"[{APP_NAME}] {site.get('name')} 25天保号检查"
     body = build_stats_report_body(site, result.stats)
     send_notifications(settings, title, body)
     site["last_stats_report_at"] = current
-
-
-def notify_manual_login_if_needed(data: dict[str, Any], site: dict[str, Any], result: CheckResult) -> None:
-    if result.status != "ok":
-        return
-    if not as_bool(site.get("manual_login_reminder_enabled"), True):
-        return
-    reminder_days = max(as_int(site.get("manual_login_reminder_days"), 30), 1)
-    reminder_anchor = as_int(site.get("last_manual_login_notify_at"), 0)
-    if not reminder_anchor:
-        reminder_anchor = as_int(site.get("last_manual_login_at"), 0)
-    if not reminder_anchor:
-        reminder_anchor = as_int(site.get("created_at"), 0) or as_int(site.get("last_success"), 0)
-    if not reminder_anchor:
-        return
-    current = now_ts()
-    if current - reminder_anchor < reminder_days * 86400:
-        return
-    cooldown = max(as_int(data.get("settings", {}).get("notify_cooldown_hours"), 12), 1) * 3600
-    last_at = as_int(site.get("last_manual_login_notify_at"), 0)
-    if current - last_at < cooldown:
-        return
-
-    settings = data.get("settings", {})
-    title = f"[{APP_NAME}] {site.get('name')} 需要手动网页登录"
-    login_url = site_login_url(site)
-    login_line = f"网页登录地址：{login_url}\n" if login_url else ""
-    body = (
-        f"站点：{site.get('name')}\n"
-        f"{login_line}"
-        f"距离上次提醒已经约 {days_since(reminder_anchor) or 0:.1f} 天。\n"
-        "请点击上面的网页登录地址，用浏览器手动登录/刷新一次。\n"
-        "说明：容器检测只能确认当前凭据是否可用，不能保证等同于站点要求的真实网页登录。"
-    )
-    send_notifications(settings, title, body)
     site["last_manual_login_notify_at"] = current
 
 
 def notify_if_needed(data: dict[str, Any], site: dict[str, Any], result: CheckResult) -> None:
     notify_stats_report_if_needed(data, site, result)
-    notify_manual_login_if_needed(data, site, result)
 
     settings = data.get("settings", {})
     cooldown = max(as_int(settings.get("notify_cooldown_hours"), 12), 1) * 3600
@@ -907,14 +872,13 @@ def render_site_form(site: dict[str, Any] | None = None, message: str = "") -> s
         "stats_report_enabled": True,
         "stats_report_interval_days": 25,
         "manual_login_reminder_enabled": True,
-        "manual_login_reminder_days": 30,
+        "manual_login_reminder_days": 25,
         "success_keywords": DEFAULT_SUCCESS_KEYWORDS,
         "failure_keywords": DEFAULT_FAILURE_KEYWORDS,
     }
     checked = "checked" if site.get("enabled", True) else ""
     mteam_checked = "checked" if as_bool(site.get("mteam_sign"), False) else ""
     stats_report_checked = "checked" if as_bool(site.get("stats_report_enabled"), True) else ""
-    manual_login_reminder_checked = "checked" if as_bool(site.get("manual_login_reminder_enabled"), True) else ""
     get_selected = "selected" if str(site.get("check_method") or "GET").upper() == "GET" else ""
     post_selected = "selected" if str(site.get("check_method") or "").upper() == "POST" else ""
     message_html = f"<div class='message'>{esc(message)}</div>" if message else ""
@@ -1004,27 +968,16 @@ def render_site_form(site: dict[str, Any] | None = None, message: str = "") -> s
       </div>
       <div class="grid">
         <div>
-          <label>上传下载数据通知</label>
+          <label>25 天综合提醒</label>
           <input type="hidden" name="stats_report_enabled_present" value="1">
-          <label class="inline option-line"><input type="checkbox" name="stats_report_enabled" value="1" {stats_report_checked}> 检测成功后定期发送上传量、下载量、分享率</label>
+          <label class="inline option-line"><input type="checkbox" name="stats_report_enabled" value="1" {stats_report_checked}> 检测成功后发送登录状态、上传量、下载量、分享率和网页登录地址</label>
         </div>
         <div>
-          <label>数据通知间隔天数</label>
+          <label>综合提醒间隔天数</label>
           <input name="stats_report_interval_days" value="{esc(site.get("stats_report_interval_days", 25))}">
         </div>
       </div>
-      <div class="grid">
-        <div>
-          <label>手动网页登录提醒</label>
-          <input type="hidden" name="manual_login_reminder_enabled_present" value="1">
-          <label class="inline option-line"><input type="checkbox" name="manual_login_reminder_enabled" value="1" {manual_login_reminder_checked}> 定期提醒你用浏览器手动登录一次</label>
-        </div>
-        <div>
-          <label>手动登录提醒天数</label>
-          <input name="manual_login_reminder_days" value="{esc(site.get("manual_login_reminder_days", 30))}">
-        </div>
-      </div>
-      <div class="hint">推荐：检测间隔 600 小时，数据通知间隔 25 天，手动网页登录提醒 30 天。提醒会带站点首页链接，可直接点击打开网页登录。</div>
+      <div class="hint">推荐：检测间隔 600 小时，综合提醒间隔 25 天。每次提醒只发一条消息，同时包含登录状态、上传量、下载量、分享率和站点首页链接，可直接点击打开网页登录。</div>
       <label>成功关键词</label>
       <textarea name="success_keywords">{esc(site.get("success_keywords") or DEFAULT_SUCCESS_KEYWORDS)}</textarea>
       <div class="hint">检测页面包含任意成功关键词即认为仍处于登录状态。建议用“退出、用户中心、上传量、魔力”等登录后才出现的词。</div>
@@ -1185,11 +1138,31 @@ class Handler(BaseHTTPRequestHandler):
             self._redirect("/?saved=1")
             return
         if self.path == "/test-notify":
-            settings = load_config().get("settings", {})
+            data = load_config()
+            settings = data.get("settings", {})
+            site = next((item for item in data.get("sites", []) if item.get("enabled", True)), None)
+            if site:
+                stats = site.get("last_stats") if isinstance(site.get("last_stats"), dict) else {}
+                if not stats:
+                    stats = {"uploaded": "示例", "downloaded": "示例", "share_rate": "示例"}
+                title = f"[{APP_NAME}] {site.get('name')} 25天保号检查"
+                body = build_stats_report_body(site, stats)
+            else:
+                title = f"[{APP_NAME}] 25天保号检查"
+                body = (
+                    "站点：示例 PT\n"
+                    "登录状态：有效\n"
+                    "上传量：示例\n"
+                    "下载量：示例\n"
+                    "分享率：示例\n"
+                    "网页登录地址：https://example.com/\n"
+                    "提醒：请点击上面的网页登录地址，用浏览器手动登录/刷新一次。\n"
+                    f"检测时间：{format_time(now_ts())}"
+                )
             send_notifications(
                 settings,
-                f"[{APP_NAME}] 测试通知",
-                "如果你收到这条消息，说明 PT Login Keeper 的微信通知配置正常。",
+                title,
+                body,
             )
             self._redirect("/?notify_test=1")
             return
