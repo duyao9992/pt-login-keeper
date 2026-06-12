@@ -11,6 +11,8 @@ PT 站 Cookie 登录保活与失效提醒工具。
 - 定时检测登录状态
 - 手动立即检测
 - 成功/失效关键词自定义
+- GET / POST 检测方式
+- M-Team API 签名检测
 - 30 天保号倒计时提醒
 - Webhook、企业微信机器人/微信转发、Server 酱、PushPlus 通知
 - Docker 部署
@@ -101,6 +103,37 @@ password
 ```
 
 10. 保存后点击“检测”或“立即检测全部”。
+
+## M-Team / 馒头配置
+
+M-Team 新版页面是前端应用，首页 `https://kp.m-team.cc/index` 直接请求只能拿到空壳 HTML，里面没有“退出、魔力值、上傳量”等登录文字。因此不要用首页做检测地址。
+
+推荐配置：
+
+```text
+检测地址：https://api.m-team.cc/api/member/profile
+检测方法：POST
+M-Team API 签名：启用
+成功关键词：你的用户名
+失效关键词：Full authentication
+失效关键词：非法用戶端
+失效关键词："code":401
+```
+
+在浏览器已经登录 M-Team 后，打开开发者工具 `Network`，找一个 `api.m-team.cc/api/...` 请求，复制 `Request Headers` 或 `Copy as cURL` 粘贴到“请求头或 cURL”。工具会尽量自动提取：
+
+```text
+authorization
+did
+visitorId
+version
+webVersion
+user-agent
+referer
+accept-language
+```
+
+如果检测结果是 `非法用戶端`，通常是缺少 `did` 或 `visitorId`，需要重新从当前浏览器的 API 请求头里复制完整请求头。
 
 ## 微信通知
 

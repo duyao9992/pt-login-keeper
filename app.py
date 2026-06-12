@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import html
 import json
 import logging
@@ -132,6 +134,12 @@ def normalize_site(form: dict[str, list[str]], existing: dict[str, Any] | None =
     user_agent = form_value(form, "user_agent").strip() or extracted.get("user-agent", "")
     referer = form_value(form, "referer").strip() or extracted.get("referer", "")
     accept_language = form_value(form, "accept_language").strip() or extracted.get("accept-language", "")
+    check_method = (form_value(form, "check_method").strip() or existing.get("check_method") or "GET").upper()
+    if check_method not in {"GET", "POST"}:
+        check_method = "GET"
+    mteam_sign = "mteam_sign" in form
+    if "mteam_sign_present" not in form and existing and "mteam_sign" in existing:
+        mteam_sign = as_bool(existing.get("mteam_sign"), False)
     return {
         **existing,
         "id": site_id,
@@ -139,9 +147,25 @@ def normalize_site(form: dict[str, list[str]], existing: dict[str, Any] | None =
         "name": form_value(form, "name").strip(),
         "url": form_value(form, "url").strip(),
         "check_url": form_value(form, "check_url").strip(),
+        "check_method": check_method,
+        "mteam_sign": mteam_sign,
         "request_headers": request_headers,
         "cookie": cookie,
         "authorization": authorization,
+        "did": form_value(form, "did").strip() or extracted.get("did", "") or existing.get("did", ""),
+        "visitor_id": (
+            form_value(form, "visitor_id").strip()
+            or extracted.get("visitorid", "")
+            or extracted.get("visitorId", "")
+            or existing.get("visitor_id", "")
+        ),
+        "api_version": form_value(form, "api_version").strip() or extracted.get("version", "") or existing.get("api_version", ""),
+        "web_version": (
+            form_value(form, "web_version").strip()
+            or extracted.get("webversion", "")
+            or extracted.get("webVersion", "")
+            or existing.get("web_version", "")
+        ),
         "user_agent": user_agent,
         "referer": referer,
         "accept_language": accept_language,
@@ -205,12 +229,24 @@ def parse_request_headers(raw: str) -> dict[str, str]:
         "user-agent",
         "referer",
         "accept-language",
+        "did",
+        "visitorid",
+        "version",
+        "webversion",
     }
     for idx, line in enumerate(lines[:-1]):
         key = line.rstrip(":").strip().lower()
         if key in known and key not in headers and ":" not in line:
             headers[key] = lines[idx + 1].strip()
     return headers
+
+
+def make_mteam_signature(url: str, method: str, timestamp: str) -> str:
+    secret = os.getenv("MTEAM_SECRET", "HLkPcWmycL57mfJt")
+    path = urlparse(url).path or "/"
+    message = f"{method.upper()}&{path}&{timestamp}"
+    digest = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha1).digest()
+    return base64.b64encode(digest).decode("ascii")
 
 
 def check_site(site: dict[str, Any]) -> CheckResult:
@@ -235,15 +271,46 @@ def check_site(site: dict[str, Any]) -> CheckResult:
     if cookie:
         headers["Cookie"] = cookie
     if authorization:
-        headers["Authorization"] = authorization
+        # M-Team's API is case-sensitive in practice, even though HTTP header
+        # names should be case-insensitive. Lowercase keeps it compatible.
+        headers["authorization"] = authorization
     referer = str(site.get("referer") or "").strip()
     if referer:
         headers["Referer"] = referer
+    if str(site.get("did") or "").strip():
+        headers["did"] = str(site.get("did")).strip()
+    if str(site.get("visitor_id") or "").strip():
+        headers["visitorId"] = str(site.get("visitor_id")).strip()
+    if str(site.get("api_version") or "").strip():
+        headers["version"] = str(site.get("api_version")).strip()
+    if str(site.get("web_version") or "").strip():
+        headers["webVersion"] = str(site.get("web_version")).strip()
     session.headers.update(headers)
 
     timeout = as_int(os.getenv("REQUEST_TIMEOUT"), 30)
+    method = str(site.get("check_method") or "GET").strip().upper()
+    if method not in {"GET", "POST"}:
+        method = "GET"
+    params: dict[str, str] = {}
+    files: dict[str, tuple[None, str]] | None = None
+    if as_bool(site.get("mteam_sign"), False):
+        timestamp = str(int(time.time() * 1000))
+        params["_timestamp"] = timestamp
+        params["_sgin"] = make_mteam_signature(check_url, method, timestamp)
+        session.headers.setdefault("Origin", "https://kp.m-team.cc")
+        session.headers.setdefault("Referer", "https://kp.m-team.cc/")
+        session.headers.setdefault("version", str(site.get("api_version") or "1.1.4"))
+        session.headers.setdefault("webVersion", str(site.get("web_version") or "1140"))
+        session.headers.setdefault("ts", str(int(time.time())))
+        session.headers.setdefault("visitorId", str(site.get("visitor_id") or ""))
+        if method == "POST":
+            files = {key: (None, value) for key, value in params.items()}
+            params = {}
     try:
-        resp = session.get(check_url, timeout=timeout, allow_redirects=True)
+        if method == "POST":
+            resp = session.post(check_url, data=params if files is None else None, files=files, timeout=timeout, allow_redirects=True)
+        else:
+            resp = session.get(check_url, params=params, timeout=timeout, allow_redirects=True)
     except Exception as exc:
         return CheckResult("error", f"请求失败：{exc.__class__.__name__}: {exc}")
 
@@ -525,12 +592,16 @@ def render_site_row(site: dict[str, Any]) -> str:
 def render_site_form(site: dict[str, Any] | None = None, message: str = "") -> str:
     site = site or {
         "enabled": True,
+        "check_method": "GET",
         "interval_hours": 168,
         "expire_days": 30,
         "success_keywords": DEFAULT_SUCCESS_KEYWORDS,
         "failure_keywords": DEFAULT_FAILURE_KEYWORDS,
     }
     checked = "checked" if site.get("enabled", True) else ""
+    mteam_checked = "checked" if as_bool(site.get("mteam_sign"), False) else ""
+    get_selected = "selected" if str(site.get("check_method") or "GET").upper() == "GET" else ""
+    post_selected = "selected" if str(site.get("check_method") or "").upper() == "POST" else ""
     message_html = f"<div class='message'>{esc(message)}</div>" if message else ""
     return page_shell(
         f"""
@@ -553,12 +624,46 @@ def render_site_form(site: dict[str, Any] | None = None, message: str = "") -> s
       </div>
       <label>检测地址</label>
       <input name="check_url" value="{esc(site.get("check_url", ""))}" placeholder="建议填用户中心/控制面板地址；留空则使用首页">
+      <div class="grid">
+        <div>
+          <label>检测方法</label>
+          <select name="check_method">
+            <option value="GET" {get_selected}>GET</option>
+            <option value="POST" {post_selected}>POST</option>
+          </select>
+        </div>
+        <div>
+          <label>M-Team API 签名</label>
+          <input type="hidden" name="mteam_sign_present" value="1">
+          <label class="inline option-line"><input type="checkbox" name="mteam_sign" value="1" {mteam_checked}> 启用 M-Team `_sgin` 签名</label>
+        </div>
+      </div>
       <label>请求头或 cURL</label>
-      <textarea name="request_headers" placeholder="可直接粘贴 Copy as cURL，或粘贴 Request Headers；保存时会自动提取 Cookie / Authorization / User-Agent">{esc(site.get("request_headers", ""))}</textarea>
+      <textarea name="request_headers" placeholder="可直接粘贴 Copy as cURL，或粘贴 Request Headers；保存时会自动提取 Cookie / Authorization / User-Agent / did / visitorId">{esc(site.get("request_headers", ""))}</textarea>
       <label>Cookie</label>
       <textarea name="cookie" placeholder="可手动填写 Cookie；如果上面粘贴了 cURL/请求头，这里可留空自动提取">{esc(site.get("cookie", ""))}</textarea>
       <label>Authorization</label>
       <textarea name="authorization" placeholder="可选，例如 Bearer xxx；如果请求头里有 authorization，会自动提取">{esc(site.get("authorization", ""))}</textarea>
+      <div class="grid">
+        <div>
+          <label>did</label>
+          <input name="did" value="{esc(site.get("did", ""))}" placeholder="M-Team API 可选，从请求头自动提取">
+        </div>
+        <div>
+          <label>visitorId</label>
+          <input name="visitor_id" value="{esc(site.get("visitor_id", ""))}" placeholder="M-Team API 可选，从请求头自动提取">
+        </div>
+      </div>
+      <div class="grid">
+        <div>
+          <label>API version</label>
+          <input name="api_version" value="{esc(site.get("api_version", ""))}" placeholder="M-Team 默认 1.1.4">
+        </div>
+        <div>
+          <label>Web version</label>
+          <input name="web_version" value="{esc(site.get("web_version", ""))}" placeholder="M-Team 默认 1140">
+        </div>
+      </div>
       <div class="grid">
         <div>
           <label>User-Agent</label>
@@ -618,7 +723,8 @@ def page_shell(content: str, title: str) -> str:
     .submit-row {{ margin-top:18px; }}
     label {{ display:block; font-weight:650; margin:16px 0 8px; }}
     label.inline {{ display:flex; gap:8px; align-items:center; margin-top:0; }}
-    input,textarea {{ width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:7px; padding:10px 12px; font-size:15px; background:#fff; }}
+    .option-line {{ min-height:40px; }}
+    input,textarea,select {{ width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:7px; padding:10px 12px; font-size:15px; background:#fff; }}
     textarea {{ min-height:120px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; line-height:1.5; }}
     table {{ width:100%; border-collapse:collapse; }}
     th,td {{ text-align:left; border-bottom:1px solid #e5e7eb; padding:10px; vertical-align:top; }}
