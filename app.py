@@ -558,13 +558,15 @@ def notify_manual_login_if_needed(data: dict[str, Any], site: dict[str, Any], re
     if not as_bool(site.get("manual_login_reminder_enabled"), True):
         return
     reminder_days = max(as_int(site.get("manual_login_reminder_days"), 30), 1)
-    last_manual_login_at = as_int(site.get("last_manual_login_at"), 0)
-    if not last_manual_login_at:
-        last_manual_login_at = as_int(site.get("created_at"), 0) or as_int(site.get("last_success"), 0)
-    if not last_manual_login_at:
+    reminder_anchor = as_int(site.get("last_manual_login_notify_at"), 0)
+    if not reminder_anchor:
+        reminder_anchor = as_int(site.get("last_manual_login_at"), 0)
+    if not reminder_anchor:
+        reminder_anchor = as_int(site.get("created_at"), 0) or as_int(site.get("last_success"), 0)
+    if not reminder_anchor:
         return
     current = now_ts()
-    if current - last_manual_login_at < reminder_days * 86400:
+    if current - reminder_anchor < reminder_days * 86400:
         return
     cooldown = max(as_int(data.get("settings", {}).get("notify_cooldown_hours"), 12), 1) * 3600
     last_at = as_int(site.get("last_manual_login_notify_at"), 0)
@@ -578,8 +580,8 @@ def notify_manual_login_if_needed(data: dict[str, Any], site: dict[str, Any], re
     body = (
         f"站点：{site.get('name')}\n"
         f"{login_line}"
-        f"距离上次记录的手动网页登录已经约 {days_since(last_manual_login_at) or 0:.1f} 天。\n"
-        "请用浏览器打开站点并手动登录/刷新一次，完成后回到 PT Login Keeper 点“已手动登录”。\n"
+        f"距离上次提醒已经约 {days_since(reminder_anchor) or 0:.1f} 天。\n"
+        "请点击上面的网页登录地址，用浏览器手动登录/刷新一次。\n"
         "说明：容器检测只能确认当前凭据是否可用，不能保证等同于站点要求的真实网页登录。"
     )
     send_notifications(settings, title, body)
@@ -889,7 +891,6 @@ def render_site_row(site: dict[str, Any]) -> str:
         <td>
           <div class="actions">
             <form method="post" action="/check"><input type="hidden" name="id" value="{esc(site.get("id"))}"><button class="small" type="submit">检测</button></form>
-            <form method="post" action="/mark-manual-login"><input type="hidden" name="id" value="{esc(site.get("id"))}"><button class="small" type="submit">已手动登录</button></form>
             <a class="small link-button" href="/site?id={esc(site.get("id"))}">编辑</a>
             <form method="post" action="/delete" onsubmit="return confirm('确认删除？')"><input type="hidden" name="id" value="{esc(site.get("id"))}"><button class="small danger" type="submit">删除</button></form>
           </div>
@@ -1023,7 +1024,7 @@ def render_site_form(site: dict[str, Any] | None = None, message: str = "") -> s
           <input name="manual_login_reminder_days" value="{esc(site.get("manual_login_reminder_days", 30))}">
         </div>
       </div>
-      <div class="hint">推荐：检测间隔 600 小时，数据通知间隔 25 天，手动网页登录提醒 30 天。完成手动网页登录后，在首页点该站点的“已手动登录”。</div>
+      <div class="hint">推荐：检测间隔 600 小时，数据通知间隔 25 天，手动网页登录提醒 30 天。提醒会带站点首页链接，可直接点击打开网页登录。</div>
       <label>成功关键词</label>
       <textarea name="success_keywords">{esc(site.get("success_keywords") or DEFAULT_SUCCESS_KEYWORDS)}</textarea>
       <div class="hint">检测页面包含任意成功关键词即认为仍处于登录状态。建议用“退出、用户中心、上传量、魔力”等登录后才出现的词。</div>
@@ -1159,8 +1160,6 @@ class Handler(BaseHTTPRequestHandler):
             message = "已删除"
         if "notify_test=1" in parsed.query:
             message = "已发送测试通知"
-        if "manual_login_marked=1" in parsed.query:
-            message = "已记录手动网页登录时间"
         self._send_html(render_page(message))
 
     def do_POST(self) -> None:
@@ -1213,18 +1212,6 @@ class Handler(BaseHTTPRequestHandler):
                     sites.append(site)
                 save_config(data)
             self._redirect("/?saved=1")
-            return
-        if self.path == "/mark-manual-login":
-            site_id = form_value(form, "id")
-            with STATE_LOCK:
-                data = load_config()
-                site = get_site(data, site_id)
-                if site is not None:
-                    current = now_ts()
-                    site["last_manual_login_at"] = current
-                    site["last_manual_login_notify_at"] = 0
-                    save_config(data)
-            self._redirect("/?manual_login_marked=1")
             return
         if self.path == "/delete":
             site_id = form_value(form, "id")
