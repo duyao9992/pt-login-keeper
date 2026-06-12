@@ -383,12 +383,9 @@ def build_stats_report_body(site: dict[str, Any], stats: dict[str, Any]) -> str:
     lines = [f"站点：{site.get('name')}", "登录状态：有效"]
     if stats.get("username"):
         lines.append(f"用户：{stats.get('username')}")
-    if stats.get("uploaded"):
-        lines.append(f"上传量：{stats.get('uploaded')}")
-    if stats.get("downloaded"):
-        lines.append(f"下载量：{stats.get('downloaded')}")
-    if stats.get("share_rate"):
-        lines.append(f"分享率：{stats.get('share_rate')}")
+    lines.append(f"上传量：{stats.get('uploaded') or '未读取到'}")
+    lines.append(f"下载量：{stats.get('downloaded') or '未读取到'}")
+    lines.append(f"分享率：{stats.get('share_rate') or '未读取到'}")
     if stats.get("bonus"):
         lines.append(f"魔力/积分：{stats.get('bonus')}")
     if stats.get("last_login"):
@@ -536,7 +533,7 @@ def days_since(ts: Any) -> float | None:
 
 
 def notify_stats_report_if_needed(data: dict[str, Any], site: dict[str, Any], result: CheckResult) -> None:
-    if result.status != "ok" or not result.stats:
+    if result.status != "ok":
         return
     if not as_bool(site.get("stats_report_enabled"), True):
         return
@@ -548,7 +545,8 @@ def notify_stats_report_if_needed(data: dict[str, Any], site: dict[str, Any], re
 
     settings = data.get("settings", {})
     title = f"[{APP_NAME}] {site.get('name')} 25天保号检查"
-    body = build_stats_report_body(site, result.stats)
+    fallback_stats = site.get("last_stats") if isinstance(site.get("last_stats"), dict) else {}
+    body = build_stats_report_body(site, result.stats or fallback_stats)
     send_notifications(settings, title, body)
     site["last_stats_report_at"] = current
     site["last_manual_login_notify_at"] = current
